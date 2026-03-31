@@ -1,0 +1,75 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-north-1
+
+      - name: Package pipeline code
+        run: |
+          zip -r pipeline_code.zip \
+            main.py \
+            config.py \
+            utils/ \
+            pipeline/ \
+            approaches/ \
+            -x "*.pyc" -x "*__pycache__*"
+
+      - name: Upload code and data to S3
+        run: |
+          aws s3 cp pipeline_code.zip s3://${{ secrets.S3_BUCKET }}/code/pipeline_code.zip
+
+      - name: Submit EMR Serverless job
+        id: submit_job
+        run: |
+          JOB_RUN_ID=$(aws emr-serverless start-job-run \
+            --application-id ${{ secrets.EMR_APPLICATION_ID }} \
+            --execution-role-arn arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/EMRServerlessExecutionRole \
+            --job-driver '{
+              "sparkSubmit": {
+                "entryPoint": "s3://${{ secrets.S3_BUCKET }}/code/main.py",
+                "sparkSubmitParameters": "--py-files s3://${{ secrets.S3_BUCKET }}/code/pipeline_code.zip"
+              }
+            }' \
+            --configuration-overrides '{
+              "monitoringConfiguration": {
+                "s3MonitoringConfiguration": {
+                  "logUri": "s3://${{ secrets.S3_BUCKET }}/logs/"
+                }
+              }
+            }' \
+            --query jobRunId \
+            --output text)
+          echo "job_run_id=$JOB_RUN_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for job completion
+        run: |
+          while true; do
+            STATUS=$(aws emr-serverless get-job-run \
+              --application-id ${{ secrets.EMR_APPLICATION_ID }} \
+              --job-run-id ${{ steps.submit_job.outputs.job_run_id }} \
+              --query jobRun.state \
+              --output text)
+            echo "Job status: $STATUS"
+            if [ "$STATUS" = "SUCCESS" ]; then
+              echo "Job completed successfully"
+              exit 0
+            elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CANCELLED" ]; then
+              echo "Job failed with status: $STATUS"
+              exit 1
+            fi
+            sleep 30
+          done
